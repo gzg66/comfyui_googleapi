@@ -51,15 +51,24 @@ class Gemini3ImageNode(io.ComfyNode):
         输出使用 "io.Model.Output"，输入使用 "io.Model.Input"。
         类型可以是 "Combo" - 表示下拉选项列表。
         """
+        # 构建可选图片输入（最多9张）
+        optional_inputs = []
+        for i in range(1, 10):
+            optional_inputs.append(io.Image.Input(f"image_{i}", optional=True))
+
         return io.Schema(
             node_id="Gemini3ImageNode",
             display_name="Gemini 3 Image (Google API)",
             category="LLM/Google",
             inputs=[
                 io.String.Input("api_key", multiline=False),
+                io.String.Input("system_prompt", multiline=True, default=""),
                 io.String.Input("prompt", multiline=True),
-                io.Image.Input("input_image"),
-                io.String.Input("model", default="gemini-3-pro-image-preview"),
+                io.Combo.Input(
+                    "model",
+                    options=["gemini-3-pro-image-preview", "gemini-3-flash-preview"],
+                    default="gemini-3-pro-image-preview",
+                ),
                 io.Combo.Input(
                     "aspect_ratio",
                     options=["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
@@ -70,26 +79,79 @@ class Gemini3ImageNode(io.ComfyNode):
                     options=["1K", "2K", "4K"],
                     default="1K",
                 ),
+                *optional_inputs,  # 添加9个可选图片输入
             ],
             outputs=[
                 io.Image.Output("image"),
+                io.String.Output("text"),
             ],
         )
+
+    @classmethod
+    def check_lazy_status(
+        cls,
+        api_key,
+        system_prompt,
+        prompt,
+        model,
+        aspect_ratio,
+        image_size,
+        image_1=None,
+        image_2=None,
+        image_3=None,
+        image_4=None,
+        image_5=None,
+        image_6=None,
+        image_7=None,
+        image_8=None,
+        image_9=None,
+    ):
+        """
+        返回需要被计算的输入名称列表。
+
+        当存在 lazy 输入尚未计算时会调用该函数。只要返回至少一个
+        未计算字段（且仍有更多未计算字段），当请求字段可用时此函数会再次被调用。
+
+        已计算的输入会作为参数传入；未计算的输入值为 None。
+        """
+        # 检查必需输入是否都已提供
+        if not api_key or not prompt or not model:
+            return ["api_key", "prompt", "model", "system_prompt", "aspect_ratio", "image_size"]
+
+        # 图片输入都是可选的，只要必需输入都已提供就可以执行
+        return []
 
     @classmethod
     def execute(
         cls,
         api_key: str,
+        system_prompt: str,
         prompt: str,
-        input_image: torch.Tensor,
         model: str,
         aspect_ratio: str,
         image_size: str,
+        image_1=None,
+        image_2=None,
+        image_3=None,
+        image_4=None,
+        image_5=None,
+        image_6=None,
+        image_7=None,
+        image_8=None,
+        image_9=None,
     ) -> io.NodeOutput:
         if not api_key or not api_key.strip():
             raise ValueError("api_key 不能为空")
         if not prompt or not str(prompt).strip():
             raise ValueError("prompt 不能为空")
+
+        # 收集所有非空的图片输入
+        input_images = [image_1, image_2, image_3, image_4, image_5, image_6, image_7, image_8, image_9]
+        input_images = [img for img in input_images if img is not None]  # 自动过滤掉空值
+
+        # 验证图片数量（小于10张）
+        if len(input_images) >= 10:
+            raise ValueError("图片数量不能超过9张")
 
         try:
             # 初始化客户端
@@ -99,56 +161,93 @@ class Gemini3ImageNode(io.ComfyNode):
                 http_options=types.HttpOptions(api_version="v1"),
             )
 
-            # 将输入图片转换为 PIL Image
-            pil_image = cls._tensor_to_pil(input_image)
+            # 构建 contents：必须包含提示词，图片是可选的
+            contents = [prompt]
+
+            # 将输入图片转换为 PIL Image 并添加到 contents（如果有图片输入）
+            for img_tensor in input_images:
+                if img_tensor is not None:
+                    pil_image = cls._tensor_to_pil(img_tensor)
+                    contents.append(pil_image)
+
+            # 根据模型类型设置不同的输出模式
+            # gemini-3-pro-image-preview 只支持图像输出
+            # gemini-3-flash-preview 只支持文本输出
+            is_image_model = "image" in model.lower()
+            
+            # 构建配置参数
+            config_kwargs = {}
+            
+            if is_image_model:
+                # 图像生成模型：只输出图像
+                response_modalities = ["IMAGE"]
+                config_kwargs = {
+                    "response_modalities": response_modalities,
+                    "image_config": types.ImageConfig(
+                        aspectRatio=aspect_ratio,  # 宽高比
+                        imageSize=image_size,  # ✅ 分辨率参数(1.60.0版本支持)
+                    ),
+                }
+            else:
+                # 文本模型：只输出文本
+                response_modalities = ["TEXT"]
+                config_kwargs = {
+                    "response_modalities": response_modalities,
+                }
+            
+            # 如果提供了系统提示词，添加到配置中
+            if system_prompt and system_prompt.strip():
+                config_kwargs["system_instruction"] = system_prompt.strip()
+            
+            config = types.GenerateContentConfig(**config_kwargs)
 
             # 调用生成内容 API
             response = client.models.generate_content(
                 model=model,
-                contents=[prompt, pil_image],  # 必须包含图片
-                config=types.GenerateContentConfig(
-                    response_modalities=["TEXT", "IMAGE"],
-                    image_config=types.ImageConfig(
-                        aspectRatio=aspect_ratio,  # 宽高比
-                        imageSize=image_size,  # ✅ 分辨率参数(1.60.0版本支持)
-                    ),
-                ),
+                contents=contents,
+                config=config,
             )
 
             # 处理响应结果
             if not response.candidates:
                 raise RuntimeError("API 返回了空响应，没有候选结果")
 
-            # 从响应中提取图像数据
+            # 从响应中提取图像数据和文本数据
             image_bytes = None
+            text_content = ""
+            
             for candidate in response.candidates:
                 if hasattr(candidate, "content") and candidate.content:
                     for part in candidate.content.parts:
+                        # 检查是否有文本数据
+                        if hasattr(part, "text") and part.text:
+                            text_content += part.text
                         # 检查是否有图像数据
                         if hasattr(part, "inline_data") and part.inline_data:
                             image_bytes = part.inline_data.data
-                            break
                         # 兼容其他可能的图像数据格式
-                        if hasattr(part, "image") and part.image:
+                        elif hasattr(part, "image") and part.image:
                             if hasattr(part.image, "data"):
                                 image_bytes = part.image.data
-                                break
 
-            if image_bytes is None:
-                raise RuntimeError(
-                    "Google API 返回了空图像。"
-                    "可能的原因：1) API key 无效 2) 模型名称错误 3) 提示词格式不正确。"
-                    f"请检查模型名称: {model}"
-                )
+            # 处理图像输出
+            if image_bytes is not None:
+                # 将图像字节转换为 PIL Image
+                generated_image = Image.open(io_module.BytesIO(image_bytes)).convert("RGB")
+                # 转换为 ComfyUI 的 IMAGE 格式 (torch.Tensor)
+                image_np = np.array(generated_image).astype(np.float32) / 255.0
+                image_tensor = torch.from_numpy(image_np)[None,]
+            else:
+                # 如果没有图像，创建一个空的占位图像
+                # 创建一个 1x1 的黑色图像作为占位符
+                image_np = np.zeros((1, 1, 3), dtype=np.float32)
+                image_tensor = torch.from_numpy(image_np)[None,]
 
-            # 将图像字节转换为 PIL Image
-            generated_image = Image.open(io_module.BytesIO(image_bytes)).convert("RGB")
+            # 如果没有文本内容，使用空字符串
+            if not text_content:
+                text_content = ""
 
-            # 转换为 ComfyUI 的 IMAGE 格式 (torch.Tensor)
-            image_np = np.array(generated_image).astype(np.float32) / 255.0
-            image_tensor = torch.from_numpy(image_np)[None,]
-
-            return io.NodeOutput(image_tensor)
+            return io.NodeOutput(image_tensor, text_content)
 
         except Exception as e:
             error_msg = str(e)
